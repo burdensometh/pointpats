@@ -481,3 +481,160 @@ def test_qstatistic_simulation_accepts_realizations_object_without_points_attr(
     )
     assert qs.chi2_realizations.shape == (3,)
     assert 0.0 <= qs.chi2_r_pvalue <= 1.0
+
+
+# -----------------------------------------------------------------------------
+# Shared grid plan, area-proportional expectations and explicit policies
+# -----------------------------------------------------------------------------
+def test_rectangle_grid_origin_uses_window_not_points(window_poly):
+    # Points span only a small part of the window; the grid must still be
+    # anchored to the window's lower-left corner with the window's extent.
+    pts = np.array([[2.0, 2.0], [3.0, 3.0]], dtype=float)
+    r = m.RectangleM(pts, count_column=2, count_row=2, window=window_poly)
+    assert np.allclose(r.origin, [0.0, 0.0])
+    assert math.isclose(r.rectangle_width, 5.0)
+    assert math.isclose(r.rectangle_height, 2.5)
+    assert np.allclose(r.plan.total_exposed_area, window_poly.area)
+
+
+def test_rectangle_zero_exposure_cells_are_excluded(window_poly_with_hole):
+    # 10x10 window with a 2x2 hole -> area 96. A 10x10 grid gives 100 raw
+    # cells, but only 96 have positive exposed area.
+    pts = np.array([[1.0, 1.0], [5.0, 5.0], [9.0, 9.0]], dtype=float)
+    r = m.RectangleM(pts, count_column=10, count_row=10, window=window_poly_with_hole)
+    assert r.num == 100
+    assert r.plan.n_cells == 96
+    assert math.isclose(r.plan.total_exposed_area, window_poly_with_hole.area)
+    # The four hole cells (ids for x,y in [4,6]) must not be in the plan.
+    for iy in (4, 5):
+        for ix in (4, 5):
+            assert ix + iy * 10 not in r.plan.cell_ids
+
+
+def test_rectangle_expected_counts_proportional_to_exposed_area(window_multipoly):
+    pts = np.array([[0.5, 0.5], [2.5, 2.5], [0.1, 0.1], [2.9, 2.9]], dtype=float)
+    qs = m.QStatistic(
+        pts, shape="rectangle", nx=2, ny=2, window=window_multipoly, realizations=0
+    )
+    # Each part is 1x1; with a 2x2 grid over the 3x3 bounding box there are
+    # four 1.5x1.5 cells but only those overlapping the two parts are kept.
+    assert qs.plan.n_cells < 4
+    assert np.allclose(
+        qs.expected_counts.sum(), qs.n_included, equal_nan=True
+    )
+    assert np.allclose(qs.area_fraction.sum(), 1.0)
+    assert qs.df == qs.plan.n_cells - 1
+
+
+def test_observed_contributions_sum_to_chi2(window_poly_with_hole):
+    rng = np.random.default_rng(2)
+    pts = rng.random((40, 2)) * 10.0
+    qs = m.QStatistic(pts, nx=4, ny=4, window=window_poly_with_hole, realizations=0)
+    assert math.isclose(np.nansum(qs.chi2_contrib), qs.chi2, rel_tol=1e-12)
+
+
+def test_boundary_points_assigned_to_smallest_cell_id():
+    # All three points lie on shared cell boundaries of a 2x2 grid.
+    pts = np.array([[1.0, 0.5], [0.5, 1.0], [1.0, 1.0]], dtype=float)
+    r = m.RectangleM(pts, count_column=2, count_row=2, window=box(0, 0, 2, 2))
+    counts = r.point_location_sta()
+    assert counts[0] == 3  # smallest cell_id wins at each shared boundary
+    assert sum(counts.values()) == 3
+
+
+def test_outside_points_excluded_and_reported(window_poly):
+    pts = np.array([[1.0, 1.0], [-1.0, 2.0], [11.0, 2.0]], dtype=float)
+    qs = m.QStatistic(
+        pts, nx=2, ny=2, window=window_poly, outside="exclude", realizations=0
+    )
+    assert qs.n_outside == 2
+    assert qs.outside_points.shape == (2, 2)
+    assert qs.n_included == 1
+    assert np.allclose(qs.expected_counts.sum(), 1.0)
+
+
+def test_outside_points_raise_policy(window_poly):
+    pts = np.array([[1.0, 1.0], [-1.0, 2.0]], dtype=float)
+    with pytest.raises(ValueError, match="outside='raise'"):
+        m.QStatistic(pts, nx=2, ny=2, window=window_poly, outside="raise")
+
+
+def test_invalid_outside_policy_raises(pts_simple):
+    with pytest.raises(ValueError, match='outside must be either "exclude" or "raise"'):
+        m.QStatistic(pts_simple, nx=2, ny=2, outside="ignore")
+
+
+def test_point_inside_hole_is_outside(window_poly_with_hole):
+    pts = np.array([[1.0, 1.0], [5.0, 5.0]], dtype=float)
+    qs = m.QStatistic(
+        pts, nx=2, ny=2, window=window_poly_with_hole, outside="exclude"
+    )
+    assert qs.n_outside == 1
+    assert np.allclose(qs.outside_points, [[5.0, 5.0]])
+
+
+def test_hexagon_exposed_area_covers_window(window_poly_with_hole):
+    rng = np.random.default_rng(5)
+    pts = rng.random((30, 2)) * 10.0
+    h = m.HexagonM(pts, lh=1.5, window=window_poly_with_hole)
+    assert math.isclose(
+        h.plan.total_exposed_area, window_poly_with_hole.area, rel_tol=1e-9
+    )
+    in_hole = (pts[:, 0] > 4) & (pts[:, 0] < 6) & (pts[:, 1] > 4) & (pts[:, 1] < 6)
+    counts, outside, unassigned = h.plan.counts(pts)
+    assert outside.sum() == in_hole.sum()
+    assert unassigned.sum() == 0
+    assert counts.sum() == (~in_hole).sum()
+
+
+def test_hexagon_cell_order_matches_plot_and_contributions(window_poly):
+    rng = np.random.default_rng(6)
+    pts = rng.random((25, 2)) * np.array([10.0, 5.0])
+    qs = m.QStatistic(pts, shape="hexagon", lh=1.5, window=window_poly, realizations=0)
+    ax, plotted_ids = qs.mr.plot(show="counts")
+    assert plotted_ids == qs.cell_ids
+    assert len(qs.chi2_contrib) == len(qs.cell_ids)
+
+
+def test_simulation_reuses_observed_grid(monkeypatch, window_poly):
+    rng = np.random.default_rng(0)
+    pts = rng.random((20, 2)) * np.array([10.0, 5.0])
+
+    class _Real:
+        def __init__(self, points):
+            self.points = points
+
+    # Each realization has a deliberately tiny sample bounding box that would
+    # produce a different grid if it were rebuilt from the points.
+    def poisson_stub(window, intensity, realizations, rng=None):  # noqa: ARG001
+        sim = np.array([[4.0, 2.0], [4.5, 2.5]], dtype=float)
+        return [_Real(sim.copy()) for _ in range(realizations)]
+
+    monkeypatch.setattr(m, "poisson", poisson_stub)
+    qs = m.QStatistic(pts, nx=3, ny=2, window=window_poly, realizations=4, rng=0)
+
+    assert qs.mr.plan.cell_ids == qs.cell_ids
+    # The simulated statistics are all equal because the shared plan, not each
+    # sample's bounding box, defines the counts.
+    assert np.allclose(qs.chi2_realizations, qs.chi2_realizations[0])
+    # All simulated points are inside the window.
+    assert np.all(qs.sim_outside_counts == 0)
+
+
+def test_simulation_expected_counts_are_area_weighted(monkeypatch, window_poly_with_hole):
+    pts = np.array([[1.0, 1.0], [9.0, 9.0], [2.0, 8.0]], dtype=float)
+
+    def poisson_stub(window, intensity, realizations, rng=None):  # noqa: ARG001
+        # Deterministic realization with a known count distribution.
+        sim = np.array([[1.0, 1.0], [9.0, 9.0], [1.0, 9.0], [9.0, 1.0]], dtype=float)
+        return [sim.copy() for _ in range(realizations)]
+
+    monkeypatch.setattr(m, "poisson", poisson_stub)
+    qs = m.QStatistic(
+        pts, nx=4, ny=4, window=window_poly_with_hole, realizations=2, rng=0
+    )
+    sim = np.array([[1.0, 1.0], [9.0, 9.0], [1.0, 9.0], [9.0, 1.0]], dtype=float)
+    counts, _o, _u = qs.plan.counts(sim)
+    expected = counts.sum() * qs.area_fraction
+    chi2_ref, _p = scipy.stats.chisquare(counts, f_exp=expected)
+    assert np.allclose(qs.chi2_realizations, chi2_ref)
