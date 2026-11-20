@@ -182,21 +182,120 @@ def _isotropic_weights(coordinates, poly, support):
     return weights
 
 
-def _translate_pair_weights(coordinates, poly, area):
-    """Per-pair translation weights for the translation edge correction.
+# ------------------------------------------------------------#
+# Chunked pairwise computation                                 #
+# ------------------------------------------------------------#
+#
+# The uncorrected and translation-corrected K/L estimators are evaluated by a
+# chunked pairwise engine: the pattern is processed in block x block distance
+# submatrices so that, regardless of n, neither the full condensed (pdist)
+# distance vector, nor the full per-pair translation weight vector, nor a
+# (n_support, n_pairs) boolean matrix is ever materialised.  All accumulation
+# uses the same strict ``d < r`` boundary convention as the pdist-based
+# estimators, self-pairs are excluded by keeping only the strict upper
+# triangle of diagonal blocks, and each unordered pair is counted exactly once
+# (callers double the counts for directed pairs), so coincident points at
+# distinct indices contribute zero-distance pairs exactly as pdist does.
 
-    For each unordered pair (i, j), the weight is area(W)² / area(W ∩ (W + h_ij))
-    where h_ij = x_j - x_i.
+# Default block size (points per axis) for the chunked pairwise engine.
+# A block pair materialises at most _PAIRWISE_BLOCK_SIZE ** 2 distances
+# (~32 MB of float64 at 2048), keeping memory bounded for very large patterns.
+_PAIRWISE_BLOCK_SIZE = 2048
 
-    Returns a 1-D array of shape (n*(n-1)//2,) aligned with scipy pdist output.
+# Maximum number of translation vectors whose window-overlap weights are
+# computed in a single shapely batch.
+_TRANSLATE_WEIGHT_BATCH_SIZE = 2**20
+
+
+def _iter_index_blocks(n, block_size):
+    """Yield (start, stop) slices partitioning ``range(n)`` into blocks."""
+    for start in range(0, n, block_size):
+        yield start, min(start + block_size, n)
+
+
+def _pair_counts_below_support(coordinates, support, metric, block_size=None):
+    """Count unordered pairs (i < j) with distance < r for each r in support.
+
+    The pattern is scanned in block x block distance submatrices so the
+    condensed (pdist) vector and the (n_support, n_pairs) boolean matrix are
+    never materialised.  Uses the same strict ``<`` boundary convention as the
+    pdist-based estimator: only the strict upper triangle of diagonal blocks
+    is kept (excluding self-pairs and avoiding double counting), and
+    coincident points at distinct indices contribute zero-distance pairs.
     """
-    n = len(coordinates)
-    rows, cols = numpy.triu_indices(n, k=1)
-    n_pairs = len(rows)
-    translations = coordinates[cols] - coordinates[rows]  # (n_pairs, 2)
+    n = coordinates.shape[0]
+    support = numpy.asarray(support, dtype=float)
+    counts = numpy.zeros(len(support), dtype=numpy.int64)
+    if block_size is None:
+        block_size = _PAIRWISE_BLOCK_SIZE
+    block_size = max(1, min(int(block_size), max(n, 1)))
+    blocks = list(_iter_index_blocks(n, block_size))
+    for bi, (i0, i1) in enumerate(blocks):
+        coords_i = coordinates[i0:i1]
+        for j0, j1 in blocks[bi:]:
+            d_block = spatial.distance.cdist(
+                coords_i, coordinates[j0:j1], metric=metric
+            )
+            if i0 == j0:
+                # Diagonal block: keep only the strict upper triangle so
+                # self-pairs are excluded and pairs are not double counted.
+                keep = numpy.triu(numpy.ones(d_block.shape, dtype=bool), k=1)
+                d_block[~keep] = numpy.inf
+            for r_idx, r in enumerate(support):
+                counts[r_idx] += numpy.count_nonzero(d_block < r)
+    return counts
 
+
+def _condensed_counts_below_support(condensed, support, block_size=None):
+    """Count entries of a condensed (pdist) distance vector below each support.
+
+    The vector is processed in contiguous slices so the (n_support, n_pairs)
+    boolean matrix is never materialised; uses the same strict ``<``
+    boundary convention as the estimators.
+    """
+    support = numpy.asarray(support, dtype=float)
+    counts = numpy.zeros(len(support), dtype=numpy.int64)
+    if block_size is None:
+        block_size = _PAIRWISE_BLOCK_SIZE
+    slice_len = max(1, int(block_size)) ** 2
+    for start in range(0, condensed.shape[0], slice_len):
+        chunk = condensed[start : start + slice_len]
+        for r_idx, r in enumerate(support):
+            counts[r_idx] += numpy.count_nonzero(chunk < r)
+    return counts
+
+
+def _condensed_to_subscripts(k, n):
+    """Map condensed (pdist) indices to (row, col) subscripts with row < col.
+
+    Inverse of the pdist/squareform indexing of the strict upper triangle of
+    an (n, n) matrix, computed arithmetically so the full ``triu_indices``
+    arrays never need to be materialised.
+    """
+    k = numpy.asarray(k, dtype=numpy.int64)
+    # Row i of the strict upper triangle occupies condensed indices
+    # [s_i, s_i + n - 1 - i) with s_i = n*i - i*(i+1)//2.  The row of k is the
+    # largest i with s_i <= k, i.e. the smaller root of s_i = k rounded down.
+    i = numpy.floor(
+        ((2 * n - 1) - numpy.sqrt((2 * n - 1) ** 2 - 8.0 * k)) / 2
+    ).astype(numpy.int64)
+    # Guard against floating-point error at row boundaries.
+    starts = n * i - i * (i + 1) // 2
+    while numpy.any(beyond := starts + (n - 1 - i) <= k):
+        i[beyond] += 1
+        starts = n * i - i * (i + 1) // 2
+    while numpy.any(before := starts > k):
+        i[before] -= 1
+        starts = n * i - i * (i + 1) // 2
+    j = k - starts + i + 1
+    return i, j
+
+
+def _translation_overlap_weights_batch(translations, poly, area):
+    """Vectorised window-overlap weights for one batch of translations."""
+    n_pairs = len(translations)
     exterior_coords = numpy.array(poly.exterior.coords)  # (m, 2) — closed ring
-    shifted_exterior = exterior_coords[None] + translations[:, None]  # (n_pairs, m, 2)
+    shifted_exterior = exterior_coords[None] + translations[:, None]
 
     interior_rings = list(poly.interiors)
     if not interior_rings:
@@ -215,6 +314,122 @@ def _translate_pair_weights(coordinates, poly, area):
     orig_array = numpy.full(n_pairs, poly)
     overlap_areas = shapely.area(shapely.intersection(orig_array, shifted_polys))
     return numpy.where(overlap_areas > 0, area * area / overlap_areas, area * area)
+
+
+def _translation_overlap_weights(translations, poly, area):
+    """Translation-correction weights for a batch of pair displacement vectors.
+
+    For a pair (i, j) with displacement h_ij = x_j - x_i, the weight is
+    area(W)² / area(W ∩ (W + h_ij)).  The window overlaps are evaluated in
+    batches of at most _TRANSLATE_WEIGHT_BATCH_SIZE pairs so arbitrarily many
+    translations can be handled with bounded memory.
+    """
+    translations = numpy.asarray(translations, dtype=float)
+    n_pairs = len(translations)
+    weights = numpy.empty(n_pairs, dtype=float)
+    for start in range(0, n_pairs, _TRANSLATE_WEIGHT_BATCH_SIZE):
+        stop = min(start + _TRANSLATE_WEIGHT_BATCH_SIZE, n_pairs)
+        weights[start:stop] = _translation_overlap_weights_batch(
+            translations[start:stop], poly, area
+        )
+    return weights
+
+
+def _translate_pair_weights(coordinates, poly, area):
+    """Per-pair translation weights for the translation edge correction.
+
+    For each unordered pair (i, j), the weight is area(W)² / area(W ∩ (W + h_ij))
+    where h_ij = x_j - x_i.
+
+    Returns a 1-D array of shape (n*(n-1)//2,) aligned with scipy pdist output.
+    """
+    n = len(coordinates)
+    rows, cols = numpy.triu_indices(n, k=1)
+    translations = coordinates[cols] - coordinates[rows]  # (n_pairs, 2)
+    return _translation_overlap_weights(translations, poly, area)
+
+
+def _chunked_translate_weight_sums(
+    coordinates, poly, area, support, metric, block_size=None
+):
+    """Sum translation-correction weights over unordered pairs with d < r.
+
+    For each r in support, returns the sum of w_ij over pairs (i < j) with
+    d_ij < r, where w_ij = area(W)² / area(W ∩ (W + h_ij)).  Pair blocks are
+    scanned chunk by chunk and the window-overlap weights are computed in
+    batches, only for pairs closer than max(support) — the full condensed
+    distance vector and the full per-pair weight vector are never
+    materialised.  Uses the same strict ``<`` boundary convention as the
+    pdist-based estimator.
+    """
+    n = coordinates.shape[0]
+    support = numpy.asarray(support, dtype=float)
+    sums = numpy.zeros(len(support), dtype=float)
+    finite_support = support[~numpy.isnan(support)]
+    if len(finite_support) == 0 or n < 2:
+        return sums
+    r_max = finite_support.max()
+    if block_size is None:
+        block_size = _PAIRWISE_BLOCK_SIZE
+    block_size = max(1, min(int(block_size), n))
+    blocks = list(_iter_index_blocks(n, block_size))
+    for bi, (i0, i1) in enumerate(blocks):
+        coords_i = coordinates[i0:i1]
+        for j0, j1 in blocks[bi:]:
+            coords_j = coordinates[j0:j1]
+            d_block = spatial.distance.cdist(coords_i, coords_j, metric=metric)
+            if i0 == j0:
+                # Diagonal block: strict upper triangle only (see above).
+                keep = numpy.triu(numpy.ones(d_block.shape, dtype=bool), k=1)
+                d_block[~keep] = numpy.inf
+            within = d_block < r_max
+            if not within.any():
+                continue
+            rows_l, cols_l = numpy.nonzero(within)
+            translations = coords_j[cols_l] - coords_i[rows_l]
+            weights = _translation_overlap_weights(translations, poly, area)
+            d_sel = d_block[within]
+            for r_idx, r in enumerate(support):
+                sums[r_idx] += weights[d_sel < r].sum()
+    return sums
+
+
+def _condensed_translate_weight_sums(
+    condensed, coordinates, poly, area, support, block_size=None
+):
+    """Sum translation-correction weights over pairs with d < r from a
+    precomputed condensed (pdist) distance vector.
+
+    The vector is processed in contiguous slices and selected entries are
+    mapped back to point pairs arithmetically, so neither the full
+    ``triu_indices`` arrays nor the full per-pair weight vector is
+    materialised.  Uses the same strict ``<`` boundary convention.
+    """
+    n = coordinates.shape[0]
+    support = numpy.asarray(support, dtype=float)
+    sums = numpy.zeros(len(support), dtype=float)
+    finite_support = support[~numpy.isnan(support)]
+    if len(finite_support) == 0:
+        return sums
+    r_max = finite_support.max()
+    if block_size is None:
+        block_size = _PAIRWISE_BLOCK_SIZE
+    slice_len = max(1, int(block_size)) ** 2
+    n_pairs = condensed.shape[0]
+    for start in range(0, n_pairs, slice_len):
+        stop = min(start + slice_len, n_pairs)
+        d_chunk = condensed[start:stop]
+        within = d_chunk < r_max
+        if not within.any():
+            continue
+        k_sel = numpy.nonzero(within)[0] + start
+        rows, cols = _condensed_to_subscripts(k_sel, n)
+        translations = coordinates[cols] - coordinates[rows]
+        weights = _translation_overlap_weights(translations, poly, area)
+        d_sel = d_chunk[within]
+        for r_idx, r in enumerate(support):
+            sums[r_idx] += weights[d_sel < r].sum()
+    return sums
 
 
 def _kaplan_meier_cdf(obs_times, events):
@@ -923,6 +1138,17 @@ def k(
     KEstResult named tuple with fields ``support``, ``theo``, ``border``,
     ``isotropic``, ``translate`` when ``edge_correction='all'``.
     Otherwise a 2-tuple ``(support, values)``.
+
+    Notes
+    -----
+    The uncorrected and ``'translate'`` estimators are evaluated with a
+    chunked pairwise engine: pair distances and translation weights are
+    accumulated block by block, so no full condensed distance vector, no
+    complete per-pair weight vector, and no (n_support, n_pairs) boolean
+    matrix is constructed, even for very large patterns. The ``'border'``
+    and ``'isotropic'`` estimators are evaluated with radius queries on a
+    KDTree/BallTree instead. All estimators share the same strict ``d < r``
+    pair-counting convention.
     """
     if edge_correction is _NOTSET:
         warnings.warn(
@@ -1111,19 +1337,28 @@ def k(
     if use_translate:
         poly = _hull_to_poly(hull_prepared)
         area = _area(poly)
-        if upper_tri_distances is None:
-            upper_tri_distances = spatial.distance.pdist(coordinates, metric=metric)
-        w_pairs = _translate_pair_weights(coordinates, poly, area)
-        k_values = numpy.zeros(len(support))
-        for j_idx, r in enumerate(support):
-            within_r = upper_tri_distances < r
-            k_values[j_idx] = (2.0 / (n * n)) * w_pairs[within_r].sum()
+        if upper_tri_distances is not None:
+            weighted_sums = _condensed_translate_weight_sums(
+                upper_tri_distances, coordinates, poly, area, support
+            )
+        else:
+            weighted_sums = _chunked_translate_weight_sums(
+                coordinates, poly, area, support, metric
+            )
+        k_values = (2.0 / (n * n)) * weighted_sums
         return support, k_values
 
-    # Non-erosion path: condensed pairwise distances.
-    if upper_tri_distances is None:
-        upper_tri_distances = spatial.distance.pdist(coordinates, metric=metric)
-    n_pairs_less_than_d = (upper_tri_distances < support.reshape(-1, 1)).sum(axis=1)
+    # Uncorrected path: count unordered pairs below each radius with the
+    # chunked pairwise engine, so neither a full pdist vector nor a
+    # (n_support, n_pairs) boolean matrix is constructed.
+    if upper_tri_distances is not None:
+        n_pairs_less_than_d = _condensed_counts_below_support(
+            upper_tri_distances, support
+        )
+    else:
+        n_pairs_less_than_d = _pair_counts_below_support(
+            coordinates, support, metric
+        )
     intensity = n / _area(hull_prepared)
     k_estimate = ((n_pairs_less_than_d * 2) / n) / intensity
     return support, k_estimate
@@ -1289,12 +1524,13 @@ def _ripley_test(
         "metric": metric,
         "edge_correction": edge_correction,
     }
-    tree = _build_best_tree(coordinates, metric=metric)
     hull = _prepare_hull(coordinates, hull)
     empty_space_points = None
 
     if calltype in ("F", "J", "K", "L"):
         core_kwargs["hull"] = hull
+    if calltype in ("F", "J"):
+        tree = _build_best_tree(coordinates, metric=metric)
         # amortize to avoid doing this every time
         empty_space_points = poisson(coordinates, size=(1000, 1))
 
@@ -1310,6 +1546,9 @@ def _ripley_test(
                 distances = (n_distances.squeeze(), empty_space_distances.squeeze())
         else:
             pass
+    # For K and L, distances stay as supplied (None unless user-provided), so
+    # both the observed statistic and the Monte Carlo simulations are evaluated
+    # by k()/l() directly from the coordinates via the chunked pairwise engine.
     core_kwargs.update(**kwargs)
 
     observed_support, observed_statistic = stat_function(

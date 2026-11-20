@@ -4,7 +4,8 @@ import shapely
 from scipy import spatial
 from shapely.geometry import box
 
-from pointpats import f, g, j, k, l
+from pointpats import distance_statistics as dist_stats
+from pointpats import f, g, j, k, l, k_test, l_test
 from pointpats.distance_statistics import (
     FEstResult,
     GEstResult,
@@ -1321,3 +1322,216 @@ class TestLDefault:
         result = l(coords, hull=poly, support=support, edge_correction="all")
         beyond = support > max_r
         assert np.all(np.isnan(result.border[beyond]))
+
+
+# ---------------------------------------------------------------------------
+# Chunked pairwise engine tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_blocks(monkeypatch):
+    """Force the chunked pairwise engine to iterate many small blocks."""
+    monkeypatch.setattr(dist_stats, "_PAIRWISE_BLOCK_SIZE", 7)
+
+
+class TestCondensedToSubscripts:
+    """Arithmetic inverse of the pdist condensed indexing."""
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 7, 50, 233])
+    def test_matches_triu_indices(self, n):
+        k_all = np.arange(n * (n - 1) // 2)
+        rows, cols = dist_stats._condensed_to_subscripts(k_all, n)
+        expected_rows, expected_cols = np.triu_indices(n, k=1)
+        np.testing.assert_array_equal(rows, expected_rows)
+        np.testing.assert_array_equal(cols, expected_cols)
+
+    def test_empty_input(self):
+        rows, cols = dist_stats._condensed_to_subscripts(np.array([]), 5)
+        assert len(rows) == 0 and len(cols) == 0
+
+
+class TestChunkedPairCounts:
+    """Uncorrected K via the chunked pairwise engine."""
+
+    def test_multiblock_matches_single_block(self, coords_and_poly, monkeypatch):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        _, single = k(coords, hull=poly, support=support, edge_correction=None)
+        monkeypatch.setattr(dist_stats, "_PAIRWISE_BLOCK_SIZE", 7)
+        _, chunked = k(coords, hull=poly, support=support, edge_correction=None)
+        np.testing.assert_allclose(chunked, single)
+
+    def test_multiblock_matches_manual_pdist(self, coords_and_poly, tiny_blocks):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        _, chunked = k(coords, hull=poly, support=support, edge_correction=None)
+        pdist = spatial.distance.pdist(coords)
+        n = len(coords)
+        intensity = n / 100.0
+        expected = np.array([(pdist < r).sum() for r in support])
+        expected = (expected * 2 / n) / intensity
+        np.testing.assert_allclose(chunked, expected)
+
+    def test_precomputed_condensed_matches_chunked(self, coords_and_poly, tiny_blocks):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        pdist = spatial.distance.pdist(coords)
+        _, from_dists = k(
+            coords, hull=poly, support=support, distances=pdist, edge_correction=None
+        )
+        _, chunked = k(coords, hull=poly, support=support, edge_correction=None)
+        np.testing.assert_allclose(from_dists, chunked)
+
+    def test_strict_boundary_convention(self, tiny_blocks):
+        # pair distances are exactly 3, 4, and 5
+        coords = np.array([[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]])
+        hull = np.array([-1.0, -1.0, 6.0, 6.0])
+        support = np.array([3.0, 3.0 + 1e-9, 5.0, 5.0 + 1e-9])
+        _, kvals = k(coords, hull=hull, support=support, edge_correction=None)
+        n = 3
+        intensity = n / 49.0
+        # strict d < r: at r=3 no pairs, at r=3+eps one pair,
+        # at r=5 the 3 and 4 pairs, at r=5+eps all three pairs
+        expected_counts = np.array([0, 1, 2, 3])
+        expected = (expected_counts * 2 / n) / intensity
+        np.testing.assert_allclose(kvals, expected)
+
+    def test_duplicate_coordinates_counted(self, tiny_blocks):
+        coords = np.array([[1.0, 1.0], [1.0, 1.0], [2.0, 1.0], [2.0, 1.0]])
+        hull = np.array([0.0, 0.0, 3.0, 3.0])
+        support = np.array([0.0, 0.5, 1.0, 1.5])
+        _, kvals = k(coords, hull=hull, support=support, edge_correction=None)
+        pdist = spatial.distance.pdist(coords)
+        n = len(coords)
+        intensity = n / 9.0
+        # two zero-distance pairs from the duplicates, four unit-distance pairs
+        expected_counts = np.array([(pdist < r).sum() for r in support])
+        assert list(expected_counts) == [0, 2, 2, 6]
+        expected = (expected_counts * 2 / n) / intensity
+        np.testing.assert_allclose(kvals, expected)
+
+    def test_self_pairs_excluded(self, tiny_blocks):
+        # a single point has no pairs at any radius
+        coords = np.array([[1.0, 1.0]])
+        hull = np.array([0.0, 0.0, 2.0, 2.0])
+        support = np.linspace(0, 1, 5)
+        _, kvals = k(coords, hull=hull, support=support, edge_correction=None)
+        np.testing.assert_array_equal(kvals, np.zeros(5))
+
+    def test_coincident_pair_counted_once_per_direction(self, tiny_blocks):
+        # two coincident points contribute exactly one unordered pair
+        coords = np.array([[1.0, 1.0], [1.0, 1.0]])
+        hull = np.array([0.0, 0.0, 2.0, 2.0])
+        support = np.array([0.5])
+        _, kvals = k(coords, hull=hull, support=support, edge_correction=None)
+        intensity = 2 / 4.0
+        np.testing.assert_allclose(kvals, [(1 * 2 / 2) / intensity])
+
+
+class TestChunkedTranslate:
+    """Translation-corrected K via the chunked pairwise engine."""
+
+    def _manual_translate(self, coords, poly, support):
+        pdist = spatial.distance.pdist(coords)
+        area = poly.area
+        weights = dist_stats._translate_pair_weights(coords, poly, area)
+        n = len(coords)
+        sums = np.array([weights[pdist < r].sum() for r in support])
+        return (2.0 / (n * n)) * sums
+
+    def test_multiblock_matches_full_weight_vector(self, coords_and_poly, tiny_blocks):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        _, chunked = k(coords, hull=poly, support=support, edge_correction="translate")
+        expected = self._manual_translate(coords, poly, support)
+        np.testing.assert_allclose(chunked, expected)
+
+    def test_multiblock_matches_single_block(self, coords_and_poly, monkeypatch):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        _, single = k(coords, hull=poly, support=support, edge_correction="translate")
+        monkeypatch.setattr(dist_stats, "_PAIRWISE_BLOCK_SIZE", 7)
+        _, chunked = k(coords, hull=poly, support=support, edge_correction="translate")
+        np.testing.assert_allclose(chunked, single)
+
+    def test_precomputed_condensed_matches_chunked(self, coords_and_poly, tiny_blocks):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        pdist = spatial.distance.pdist(coords)
+        _, from_dists = k(
+            coords,
+            hull=poly,
+            support=support,
+            distances=pdist,
+            edge_correction="translate",
+        )
+        _, chunked = k(coords, hull=poly, support=support, edge_correction="translate")
+        np.testing.assert_allclose(from_dists, chunked)
+
+    def test_strict_boundary_convention(self, tiny_blocks):
+        coords = np.array([[1.0, 1.0], [4.0, 1.0], [1.0, 5.0]])
+        poly = box(0, 0, 6, 6)
+        d01 = 3.0
+        support = np.array([d01, d01 + 1e-9])
+        _, kvals = k(coords, hull=poly, support=support, edge_correction="translate")
+        # at r == d01 the pair is excluded (strict <), just above it is included
+        assert kvals[0] == 0.0
+        assert kvals[1] > 0.0
+
+    def test_overlap_weights_batched(self, coords_and_poly, monkeypatch):
+        coords, poly = coords_and_poly
+        rows, cols = np.triu_indices(len(coords), k=1)
+        translations = coords[cols] - coords[rows]
+        unbatched = dist_stats._translation_overlap_weights(
+            translations, poly, poly.area
+        )
+        monkeypatch.setattr(dist_stats, "_TRANSLATE_WEIGHT_BATCH_SIZE", 13)
+        batched = dist_stats._translation_overlap_weights(
+            translations, poly, poly.area
+        )
+        np.testing.assert_allclose(batched, unbatched)
+
+    def test_l_consistent_with_k(self, coords_and_poly, tiny_blocks):
+        coords, poly = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        _, kvals = k(coords, hull=poly, support=support, edge_correction="translate")
+        _, lvals = l(coords, hull=poly, support=support, edge_correction="translate")
+        np.testing.assert_allclose(lvals, np.sqrt(kvals / np.pi))
+
+
+class TestMonteCarloPairwiseRoute:
+    """k_test/l_test evaluate observed and simulated statistics via k()/l()."""
+
+    def test_k_test_runs_and_matches_k(self, coords_and_poly):
+        coords, _ = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        result = k_test(coords, support=support, n_simulations=4, n_jobs=1)
+        _, expected = k(coords, support=support, edge_correction=None)
+        np.testing.assert_allclose(result.statistic, expected)
+        np.testing.assert_allclose(result.support, support)
+
+    def test_k_test_simulations_shape(self, coords_and_poly):
+        coords, _ = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        result = k_test(
+            coords, support=support, n_simulations=4, n_jobs=1, keep_simulations=True
+        )
+        assert result.simulations.shape == (4, len(support))
+        assert np.all((result.pvalue >= 0) & (result.pvalue <= 1))
+
+    def test_l_test_runs_and_matches_l(self, coords_and_poly):
+        coords, _ = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        result = l_test(coords, support=support, n_simulations=4, n_jobs=1)
+        _, expected = l(coords, support=support, edge_correction=None)
+        np.testing.assert_allclose(result.statistic, expected)
+
+    def test_l_test_linearized(self, coords_and_poly):
+        coords, _ = coords_and_poly
+        support = np.linspace(0, 4, 10)
+        result = l_test(
+            coords, support=support, n_simulations=4, n_jobs=1, linearized=True
+        )
+        _, expected = l(coords, support=support, edge_correction=None, linearized=True)
+        np.testing.assert_allclose(result.statistic, expected)
