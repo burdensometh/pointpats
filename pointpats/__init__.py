@@ -8,6 +8,7 @@ from .process import *
 from .quadrat_statistics import *
 from .distance_statistics import *
 from .spacetime import *
+from .streaming import *
 from .kde import *
 
 with contextlib.suppress(PackageNotFoundError):

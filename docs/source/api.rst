@@ -126,3 +126,14 @@ Space-Time Interaction Tests
    mantel
    jacquez
    modified_knox
+
+Streaming Space-Time Statistics
+-------------------------------
+
+.. autosummary::
+   :toctree: generated/
+
+   SlidingWindowKnox
+   StreamEvent
+   EventOutcome
+   WindowSnapshot

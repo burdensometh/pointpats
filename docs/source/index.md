@@ -20,6 +20,7 @@ user-guide/ripley
 user-guide/edge_corrections
 user-guide/random
 user-guide/marks
+user-guide/streaming
 references
 ```
 
