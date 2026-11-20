@@ -37,6 +37,13 @@ from scipy.spatial import KDTree
 from scipy.stats import hypergeom, poisson
 from shapely.geometry import LineString
 
+# Null hypotheses supported by the permutation inference in ``Knox`` and
+# ``KnoxLocal``. The unconstrained null treats event times as exchangeable
+# across all events; the stratified null only allows exchanges between
+# events in the same stratum.
+NULL_UNCONSTRAINED = "unconstrained"
+NULL_STRATIFIED = "stratified"
+
 
 class SpaceTimeEvents:
     """
@@ -664,7 +671,118 @@ def _shuffle_matrix(x, ids):
     return x[ids, :][:, ids]
 
 
-def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
+class _NullLabeledArray(np.ndarray):
+    """An ndarray that records the null hypothesis it was generated under.
+
+    The label is exposed through the ``null`` attribute and is propagated
+    across slicing and ufunc operations. Used for the permutation
+    distributions retained with ``keep=True`` so that simulations always
+    carry the null hypothesis that generated them.
+    """
+
+    def __new__(cls, values, null):
+        obj = np.asarray(values).view(cls)
+        obj.null = null
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.null = getattr(obj, "null", None)
+
+    def __reduce__(self):
+        reconstruct, args, state = super().__reduce__()
+        return reconstruct, args, (state, self.null)
+
+    def __setstate__(self, state):
+        parent_state, null = state
+        super().__setstate__(parent_state)
+        self.null = null
+
+
+def _align_stratum(stratum, ids):
+    """Align caller-supplied stratum labels with the event ids.
+
+    A pandas Series is aligned by its index to ``ids``; any other input is
+    returned unchanged and interpreted positionally. Events whose id is not
+    covered by the series receive a missing label, which is reported
+    explicitly in the strata summary.
+    """
+    if stratum is None or not isinstance(stratum, pd.Series):
+        return stratum
+    aligned = stratum.reindex(ids)
+    if aligned.isna().all() and not stratum.isna().all():
+        raise ValueError(
+            "`stratum` could not be aligned with the event ids; check that "
+            "the series index matches the ids of the events."
+        )
+    return aligned.to_numpy()
+
+
+def _build_strata(stratum, n):
+    """Validate stratum labels and summarize the stratification.
+
+    Parameters
+    ----------
+    stratum : array-like
+        one label per event, aligned with the events.
+    n : int
+        number of events.
+
+    Returns
+    -------
+    dict
+        Summary of the stratification with per-event labels, stratum counts,
+        and explicit representations of singleton strata, missing strata,
+        and events without exchangeable partners, along with the exchange
+        groups used by the stratified permutations.
+    """
+    labels = np.asarray(stratum, dtype=object).ravel()
+    if labels.shape[0] != n:
+        raise ValueError(
+            f"`stratum` must provide one label per event; got "
+            f"{labels.shape[0]} labels for {n} events."
+        )
+    missing_mask = np.asarray(pd.isna(labels), dtype=bool)
+    members = {}
+    for i, label in enumerate(labels):
+        if missing_mask[i]:
+            continue
+        members.setdefault(label, []).append(i)
+    counts = {label: len(idx) for label, idx in members.items()}
+    singletons = [label for label, idx in members.items() if len(idx) == 1]
+    # only strata with at least two events allow an exchange of times
+    groups = [np.asarray(idx) for idx in members.values() if len(idx) > 1]
+    group_of = np.full(n, -1, dtype=int)
+    for gi, group in enumerate(groups):
+        group_of[group] = gi
+    exchangeable = group_of >= 0
+    return {
+        "labels": labels,
+        "counts": counts,
+        "n_strata": len(members),
+        "singletons": singletons,
+        "missing": np.flatnonzero(missing_mask),
+        "exchangeable": exchangeable,
+        "n_exchangeable": int(exchangeable.sum()),
+        "groups": groups,
+        "group_of": group_of,
+    }
+
+
+def _within_strata_permutation(n, groups):
+    """Permute event labels within each exchangeable stratum.
+
+    Events that do not belong to an exchangeable stratum (singleton or
+    missing strata) keep their own label.
+    """
+    rids = np.arange(n)
+    for group in groups:
+        rids[group] = np.random.permutation(group)
+    return rids
+
+
+def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False, stratum=None):
     """
     Parameters
     ==========
@@ -681,6 +799,12 @@ def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
         number of permutations
     keep: bool
         return values from permutations (default False)
+    stratum: array-like, optional
+        one label per event assigning it to a stratum (aligned with the
+        events). When given, permutations only exchange times between events
+        in the same stratum. Events with a missing label (NaN or None) and
+        singleton strata keep their time stamp in every permutation. The
+        default is None, the classic unconstrained null.
 
 
     Returns
@@ -711,17 +835,34 @@ def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
               space-time count is ``ENST = NS * NT / pairs``.
 
         Inference
+            - ``"null"`` : str
+              Null hypothesis used for the permutation inference, either
+              ``"unconstrained"`` or ``"stratified"``. The analytic p-values
+              always assume the unconstrained null.
             - ``"p_value_poisson"`` : float
               One-sided analytic p-value using a Poisson model for ``NST`` with
               mean equal to the expected space-time count.
             - ``"p_value_sim"`` : float, optional
-              One-sided permutation p-value (present when ``permutations > 0``).
+              One-sided permutation p-value under ``results["null"]``
+              (present when ``permutations > 0``).
             - ``"exceedence"`` : int, optional
               Number of permutations with statistic >= observed (present when
               ``permutations > 0``).
             - ``"st_perm"`` : ndarray of shape (permutations,), optional
               Permutation distribution of the statistic (present when
-              ``permutations > 0`` and ``keep=True``).
+              ``permutations > 0`` and ``keep=True``). The array records the
+              null hypothesis it was generated under in its ``null``
+              attribute.
+
+        Stratification
+            - ``"strata"`` : dict or None
+              Summary of the stratification when ``stratum`` is given, else
+              None. Keys include ``"labels"`` (per-event stratum),
+              ``"counts"`` (events per stratum), ``"n_strata"``,
+              ``"singletons"`` (labels of single-event strata), ``"missing"``
+              (indices of events with a missing stratum), ``"exchangeable"``
+              (per-event flag for having at least one exchange partner), and
+              ``"n_exchangeable"``.
 
         Neighbor and pair structures
             - ``"sneighbors"`` : list of sets
@@ -740,11 +881,28 @@ def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
       the division by 2 after summing directed neighbor counts.
     - The permutation procedure randomly reassigns temporal neighbor labels to
       spatial neighborhoods via index permutations, generating a null
-      distribution for the global space-time neighbor count.
+      distribution for the global space-time neighbor count. When ``stratum``
+      is given, the index permutations are restricted to exchange labels only
+      within strata.
 
     """
 
     n = s_coords.shape[0]
+
+    if stratum is None:
+        strata = None
+        null = NULL_UNCONSTRAINED
+    else:
+        strata = _build_strata(stratum, n)
+        null = NULL_STRATIFIED
+        if permutations > 0 and strata["n_exchangeable"] == 0:
+            warn(
+                "No events can exchange times within their stratum (all "
+                "strata are singletons or missing); the stratified "
+                "permutation null distribution is degenerate.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     stree = KDTree(s_coords)
     ttree = KDTree(t_coords)
@@ -820,6 +978,8 @@ def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
     results["sneighbors"] = sneighbors
     results["tneighbors"] = tneighbors
     results["stneighbors"] = stneighbors
+    results["null"] = null
+    results["strata"] = strata
 
     if permutations > 0:
         exceedence = 0
@@ -830,7 +990,10 @@ def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
 
         for perm in range(permutations):
             st = 0
-            rids = np.random.permutation(ids)
+            if strata is None:
+                rids = np.random.permutation(ids)
+            else:
+                rids = _within_strata_permutation(n, strata["groups"])
             for i in range(n):
                 ri = rids[i]
                 tni = tneighbors[ri]
@@ -845,7 +1008,7 @@ def _knox(s_coords, t_coords, delta, tau, permutations=99, keep=False):
         results["p_value_sim"] = (exceedence + 1) / (permutations + 1)
         results["exceedence"] = exceedence
         if keep:
-            results["st_perm"] = st_store
+            results["st_perm"] = _NullLabeledArray(st_store, null)
 
     return results
 
@@ -869,6 +1032,13 @@ class Knox:
         number of random permutations for inference
     keep: bool
         whether to store realized values of the statistic under permutations
+    stratum: array-like, optional
+        one label per event assigning it to a stratum (e.g. a region or a
+        season), aligned with the events. When given, the permutations only
+        exchange times between events in the same stratum. Events with a
+        missing label (NaN or None) and singleton strata keep their time
+        stamp in every permutation. The default is None, the classic
+        unconstrained null.
 
 
     Attributes
@@ -887,12 +1057,27 @@ class Knox:
         number of random permutations for inference
     keep: bool
         whether to store realized values of the statistic under permutations
+    stratum: array-like or None
+        stratum labels aligned with the events (None if not given)
+    null: str
+        null hypothesis used for the permutation inference, either
+        "unconstrained" (times are exchangeable across all events) or
+        "stratified" (times are exchangeable only within the same stratum).
+        ``p_sim`` and ``sim`` are generated under this null; ``p_poisson``
+        is analytic and always assumes the unconstrained null.
+    strata: dict or None
+        summary of the stratification when ``stratum`` is given, else None.
+        Keys include "labels" (per-event stratum), "counts" (events per
+        stratum), "n_strata", "singletons" (labels of single-event strata),
+        "missing" (indices of events with a missing stratum), "exchangeable"
+        (per-event flag for having at least one exchange partner), and
+        "n_exchangeable".
     nst: int
         number of space-time pairs
     p_poisson: float
         Analytical p-value under Poisson assumption
     p_sim: float
-        Pseudo p-value based on random permutations
+        Pseudo p-value based on random permutations under ``null``
     expected: array
         Two-by-two array with expected counts under the null of no space-time
         interactions. ``[[NST, NS_], [NT_, N__]]`` where ``NST`` is the expected number
@@ -903,7 +1088,8 @@ class Knox:
     observed: array
         Same structure as expected with the observed pair classifications
     sim: array
-        Global statistics from permutations (if keep=True)
+        Global statistics from permutations (if keep=True). The array records
+        the null hypothesis it was generated under in its ``null`` attribute.
 
     Notes
     -----
@@ -936,16 +1122,41 @@ class Knox:
     True
     >>> global_knox.p_sim
     0.21
+    >>> global_knox.null
+    'unconstrained'
+
+    Strata can be supplied to restrict the permutation null so that times
+    are only exchanged between events in the same stratum, for example
+    events recorded in different regions or seasons. Here we split the
+    events into two strata based on their time of occurrence:
+
+    >>> numpy.random.seed(12345)
+    >>> stratified_knox = Knox(df[['X', 'Y']], df[["T"]], delta=20, tau=5,
+    ...                        stratum=(df["T"] < 3500).tolist(), keep=True)
+    >>> stratified_knox.null
+    'stratified'
+    >>> stratified_knox.p_sim
+    0.25
+    >>> stratified_knox.sim.null
+    'stratified'
+    >>> stratified_knox.strata["counts"]
+    {True: 86, False: 102}
     """
 
-    def __init__(self, s_coords, t_coords, delta, tau, permutations=99, keep=False):
+    def __init__(
+        self, s_coords, t_coords, delta, tau, permutations=99, keep=False, stratum=None
+    ):
+        stratum = _align_stratum(stratum, range(len(s_coords)))
         self.s_coords = s_coords
         self.t_coords = t_coords
         self.delta = delta
         self.tau = tau
         self.permutations = permutations
         self.keep = keep
-        results = _knox(s_coords, t_coords, delta, tau, permutations, keep)
+        self.stratum = stratum
+        results = _knox(s_coords, t_coords, delta, tau, permutations, keep, stratum)
+        self.null = results["null"]
+        self.strata = results["strata"]
         self.nst = int(results["nst"])
         if permutations > 0:
             self.p_sim = results["p_value_sim"]
@@ -966,6 +1177,7 @@ class Knox:
         tau: int,
         permutations: int = 99,
         keep: bool = False,
+        stratum=None,
     ):
         """Compute a Knox statistic from a dataframe of Point observations
 
@@ -989,6 +1201,12 @@ class Knox:
             permutations to use for computation inference, by default 99
         keep : bool
             whether to store realized values of the statistic under permutations
+        stratum : str, pandas.Series, or array-like, optional
+            stratum labels for the events (e.g. regions or seasons). If a
+            string, the name of a column in the dataframe; if a Series, it is
+            aligned with the dataframe index (the event ids); otherwise one
+            label per event in row order. When given, permutations only
+            exchange times between events in the same stratum.
 
         Returns
         -------
@@ -997,11 +1215,22 @@ class Knox:
 
         """
         s_coords, t_coords = _spacetime_points_to_arrays(dataframe, time_col)
+        if isinstance(stratum, str):
+            if stratum not in dataframe.columns:
+                raise ValueError(
+                    f"`stratum` column {stratum!r} not found in the dataframe"
+                )
+            stratum = dataframe[stratum]
+        stratum = _align_stratum(stratum, dataframe.index)
 
-        return cls(s_coords, dataframe[[time_col]], delta, tau, permutations, keep)
+        return cls(
+            s_coords, dataframe[[time_col]], delta, tau, permutations, keep, stratum
+        )
 
 
-def _knox_local(s_coords, t_coords, delta, tau, permutations=99, keep=False):
+def _knox_local(
+    s_coords, t_coords, delta, tau, permutations=99, keep=False, stratum=None
+):
     """
 
     Parameters
@@ -1018,11 +1247,21 @@ def _knox_local(s_coords, t_coords, delta, tau, permutations=99, keep=False):
         number of permutations for conditional randomization inference
     keep: bool
         whether to store local statistics from the permtuations
+    stratum: array-like, optional
+        one label per event assigning it to a stratum (aligned with the
+        events). When given, the conditional permutations only exchange
+        times between events in the same stratum, and each focal unit keeps
+        its own time stamp. The default is None, the classic unconstrained
+        null.
 
     """
     # think about passing in the global object
     # as an option to avoid recomputing the trees
-    res = _knox(s_coords, t_coords, delta, tau, permutations=permutations)
+    res = _knox(
+        s_coords, t_coords, delta, tau, permutations=permutations, stratum=stratum
+    )
+    strata = res["strata"]
+    null = res["null"]
     sneighbors = {i: tuple(ns) for i, ns in enumerate(res["sneighbors"])}
     tneighbors = {i: tuple(nt) for i, nt in enumerate(res["tneighbors"])}
 
@@ -1050,37 +1289,70 @@ def _knox_local(s_coords, t_coords, delta, tau, permutations=99, keep=False):
         exceedence = np.zeros(n)
         if keep:
             sti_store = np.zeros((n, permutations))
-        for perm in range(permutations):
-            rids = np.random.permutation(ids)
-            for i in range(n):
-                rids_i = rids.copy()
-                # set observed value of focal unit i
-                # swap with value assigned to rids[i]
-                # example
-                # 0 1 2 (ids)
-                # 2 0 1 (rids)
-                # i=0
-                # 0 2 1 (rids_i)
-                # i=1
-                # 2 1 0 (rids_i)
-                # i=2
-                # 1 0 2 (rids_i)
+        if strata is None:
+            for perm in range(permutations):
+                rids = np.random.permutation(ids)
+                for i in range(n):
+                    rids_i = rids.copy()
+                    # set observed value of focal unit i
+                    # swap with value assigned to rids[i]
+                    # example
+                    # 0 1 2 (ids)
+                    # 2 0 1 (rids)
+                    # i=0
+                    # 0 2 1 (rids_i)
+                    # i=1
+                    # 2 1 0 (rids_i)
+                    # i=2
+                    # 1 0 2 (rids_i)
 
-                rids_i[rids == i] = rids[i]
-                rids_i[i] = i
+                    rids_i[rids == i] = rids[i]
+                    rids_i[i] = i
 
-                # calculate local stat
-                rjs = [rids_i[j] for j in sneighbors[i]]
-                tni = tneighbors[i]
-                sti = [j for j in rjs if j in tni]
-                count = len(sti)
-                if count >= res["nsti"][i]:
-                    exceedence[i] += 1
-                if keep:
-                    sti_store[i, perm] = count
+                    # calculate local stat
+                    rjs = [rids_i[j] for j in sneighbors[i]]
+                    tni = tneighbors[i]
+                    sti = [j for j in rjs if j in tni]
+                    count = len(sti)
+                    if count >= res["nsti"][i]:
+                        exceedence[i] += 1
+                    if keep:
+                        sti_store[i, perm] = count
+        else:
+            # stratified conditional permutation: each permutation is
+            # generated directly under the constraint that the focal unit
+            # keeps its own time stamp and times are only exchanged within
+            # strata (not a global shuffle with the focal swapped back)
+            groups = strata["groups"]
+            group_of = strata["group_of"]
+            for perm in range(permutations):
+                base = _within_strata_permutation(n, groups)
+                for i in range(n):
+                    gi = group_of[i]
+                    if gi < 0:
+                        # focal unit cannot exchange its time (singleton or
+                        # missing stratum); it is already fixed in `base`
+                        rids_i = base
+                    else:
+                        # re-permute the focal unit's stratum conditional on
+                        # the focal unit keeping its own time stamp
+                        rids_i = base.copy()
+                        others = groups[gi][groups[gi] != i]
+                        rids_i[others] = np.random.permutation(others)
+                        rids_i[i] = i
+
+                    # calculate local stat
+                    rjs = [rids_i[j] for j in sneighbors[i]]
+                    tni = tneighbors[i]
+                    sti = [j for j in rjs if j in tni]
+                    count = len(sti)
+                    if count >= res["nsti"][i]:
+                        exceedence[i] += 1
+                    if keep:
+                        sti_store[i, perm] = count
 
         if keep:
-            res["sti_perm"] = sti_store
+            res["sti_perm"] = _NullLabeledArray(sti_store, null)
         res["exceedence_pvalue"] = (exceedence + 1) / (permutations + 1)
         res["exceedences"] = exceedence
 
@@ -1142,6 +1414,14 @@ class KnoxLocal:
       signifcance level for local statistics
     crs: str (optional)
         coordinate reference system string for s_coords
+    stratum: array-like, optional
+        one label per event assigning it to a stratum (e.g. a region or a
+        season), aligned with the event ids. When given, the conditional
+        permutations only exchange times between events in the same stratum,
+        and each focal unit keeps its own time stamp. Events with a missing
+        label (NaN or None) and singleton strata keep their time stamp in
+        every permutation. The default is None, the classic unconstrained
+        null.
 
     Attributes
     ----------
@@ -1159,12 +1439,28 @@ class KnoxLocal:
         number of random permutations for inference
     keep: bool
         whether to store realized values of the statistic under permutations
+    stratum: array-like or None
+        stratum labels aligned with the event ids (None if not given)
+    null: str
+        null hypothesis used for the permutation inference, either
+        "unconstrained" (times are exchangeable across all events) or
+        "stratified" (times are exchangeable only within the same stratum).
+        ``p_sim``, ``p_sims``, ``sim``, and ``sims`` are generated under this
+        null; ``p_poisson`` and ``p_hypergeom`` are analytic and always
+        assume the unconstrained null.
+    strata: dict or None
+        summary of the stratification when ``stratum`` is given, else None.
+        Keys include "labels" (per-event stratum), "counts" (events per
+        stratum), "n_strata", "singletons" (labels of single-event strata),
+        "missing" (indices of events with a missing stratum), "exchangeable"
+        (per-event flag for having at least one exchange partner), and
+        "n_exchangeable".
     nst: int
         number of space-time pairs (global)
     p_poisson: float
         Analytical p-value under Poisson assumption (global)
     p_sim: float
-        Pseudo p-value based on random permutations (global)
+        Pseudo p-value based on random permutations under ``null`` (global)
     expected: array
         Two-by-two array with expected counts under the null of no space-time
         interactions. ``[[NST, NS_], [NT_, N__]]`` where ``NST`` is the expected number
@@ -1175,12 +1471,16 @@ class KnoxLocal:
     observed: array
         Same structure as expected with the observed pair classifications (global)
     sim: array
-        Global statistics from permutations (if keep=True and keep=True) (global)
+        Local statistics from conditional permutations (if keep=True and
+        permutations>0). The array records the null hypothesis it was
+        generated under in its ``null`` attribute.
     p_sims: array
-        Local psuedo p-values from conditional permutations (if permutations>0)
+        Local psuedo p-values from conditional permutations under ``null``
+        (if permutations>0)
     sims: array
         Local statistics from conditional permutations (if keep=True and
-        permutations>0)
+        permutations>0). The array records the null hypothesis it was
+        generated under in its ``null`` attribute.
     nsti: array
         Local statistics
     p_hypergeom: array
@@ -1222,6 +1522,19 @@ class KnoxLocal:
     array([0.3 , 0.33, 0.11, 0.17, 0.3 , 0.42, 0.06, 0.06, 0.33, 0.34, 0.36,
            0.38, 0.3 , 0.29, 0.41, 0.19, 0.31, 0.39, 0.18, 0.39, 0.48, 0.41,
            0.22, 0.41, 0.39, 0.32])
+
+    Strata restrict the conditional permutations so that times are only
+    exchanged between events in the same stratum, with each focal unit
+    keeping its own time stamp:
+
+    >>> numpy.random.seed(12345)
+    >>> stratified_local = KnoxLocal(df[['X', 'Y']].values, df[["T"]].values,
+    ...                              delta=20, tau=5,
+    ...                              stratum=(df["T"] < 3500).tolist())
+    >>> stratified_local.null
+    'stratified'
+    >>> stratified_local.p_sims.shape
+    (188,)
     """
 
     def __init__(
@@ -1235,6 +1548,7 @@ class KnoxLocal:
         crit=0.05,
         crs=None,
         ids=None,
+        stratum=None,
     ):
         if not isinstance(t_coords, np.ndarray):
             raise ValueError("t_coords  should be numpy.ndarray type")
@@ -1254,6 +1568,7 @@ class KnoxLocal:
             ids = rangeids
 
         self._ids = ids
+        stratum = _align_stratum(stratum, self._ids)
         self.s_coords = s_coords
         self.t_coords = t_coords
         self.delta = delta
@@ -1261,7 +1576,12 @@ class KnoxLocal:
         self.permutations = permutations
         self.keep = keep
         self.crit = crit
-        results = _knox_local(s_coords, t_coords, delta, tau, permutations, keep)
+        self.stratum = stratum
+        results = _knox_local(
+            s_coords, t_coords, delta, tau, permutations, keep, stratum
+        )
+        self.null = results["null"]
+        self.strata = results["strata"]
         self.adjlist = results["stadjlist"]
         self.nst = int(results["nst"])
         if permutations > 0:
@@ -1291,6 +1611,9 @@ class KnoxLocal:
         if permutations > 0:
             _gdf["p_sim"] = self.p_sims
         _gdf["p_hypergeom"] = self.p_hypergeom
+        if stratum is not None:
+            _gdf["stratum"] = self.strata["labels"]
+            _gdf["exchangeable"] = self.strata["exchangeable"]
         self._gdf_static = _gdf
 
     @property
@@ -1306,6 +1629,7 @@ class KnoxLocal:
         tau: int,
         permutations: int = 99,
         keep: bool = False,
+        stratum=None,
     ):
         """Compute a set of local Knox statistics from a dataframe of Point observations
 
@@ -1329,6 +1653,13 @@ class KnoxLocal:
             permutations to use for computational inference, by default 99
         keep : bool
             whether to store realized values of the statistic under permutations
+        stratum : str, pandas.Series, or array-like, optional
+            stratum labels for the events (e.g. regions or seasons). If a
+            string, the name of a column in the dataframe; if a Series, it is
+            aligned with the dataframe index (the event ids); otherwise one
+            label per event in row order. When given, the conditional
+            permutations only exchange times between events in the same
+            stratum, with each focal unit keeping its own time stamp.
 
         Returns
         -------
@@ -1337,6 +1668,13 @@ class KnoxLocal:
 
         """
         s_coords, t_coords = _spacetime_points_to_arrays(dataframe, time_col)
+        if isinstance(stratum, str):
+            if stratum not in dataframe.columns:
+                raise ValueError(
+                    f"`stratum` column {stratum!r} not found in the dataframe"
+                )
+            stratum = dataframe[stratum]
+        stratum = _align_stratum(stratum, dataframe.index)
 
         return cls(
             s_coords,
@@ -1347,6 +1685,7 @@ class KnoxLocal:
             keep,
             crs=dataframe.crs,
             ids=dataframe.index.values,
+            stratum=stratum,
         )
 
     def hotspots(self, crit=0.05, inference="permutation", keep_neighbors=True):

@@ -2,6 +2,7 @@ import geopandas as gpd
 import libpysal as lps
 import matplotlib.pyplot as plt
 import numpy
+import pandas as pd
 import pytest
 from pytest import approx
 from shapely import LineString
@@ -379,6 +380,276 @@ class TestKnoxLocal:
         lk = KnoxLocal.from_dataframe(gdf, time_col="T", delta=20, tau=5, keep=True)
         lk.plot(inference="analytic", ax=ax2)
         assert fig
+
+
+class TestKnoxStratified:
+    def setup_method(self):
+        path = lps.examples.get_path("burkitt.shp")
+        self.gdf = gpd.read_file(path)
+        # two spatially separated clusters; within each cluster the two
+        # events are close in time, across clusters they are not
+        self.s_coords = numpy.array(
+            [[0.0, 0.0], [1.0, 0.0], [100.0, 100.0], [101.0, 100.0]]
+        )
+        self.t_coords = numpy.array([[0.0], [1.0], [100.0], [101.0]])
+        self.stratum = numpy.array(["north", "north", "south", "south"])
+
+    def test_stratified_permutation_stays_within_strata(self):
+        numpy.random.seed(12345)
+        res = Knox(
+            self.s_coords,
+            self.t_coords,
+            delta=2,
+            tau=2,
+            permutations=99,
+            keep=True,
+            stratum=self.stratum,
+        )
+        assert res.null == "stratified"
+        assert res.nst == 2
+        # times can only be exchanged within a stratum, so the two
+        # space-time pairs are preserved under every permutation
+        numpy.testing.assert_array_equal(res.sim, numpy.full(99, 2.0))
+        assert res.p_sim == 1.0
+        # the retained simulations record the null hypothesis used
+        assert res.sim.null == "stratified"
+
+        # the unconstrained null mixes times across strata
+        numpy.random.seed(12345)
+        res_unc = Knox(
+            self.s_coords, self.t_coords, delta=2, tau=2, permutations=99, keep=True
+        )
+        assert res_unc.null == "unconstrained"
+        assert res_unc.strata is None
+        assert res_unc.sim.null == "unconstrained"
+        assert (res_unc.sim != 2).any()
+
+    def test_single_stratum_equals_unconstrained(self):
+        # one stratum spanning all events reproduces the unconstrained null
+        numpy.random.seed(12345)
+        ref = Knox(self.gdf[["X", "Y"]], self.gdf[["T"]], delta=20, tau=5, keep=True)
+        numpy.random.seed(12345)
+        strat = Knox(
+            self.gdf[["X", "Y"]],
+            self.gdf[["T"]],
+            delta=20,
+            tau=5,
+            keep=True,
+            stratum=numpy.zeros(self.gdf.shape[0], dtype=int),
+        )
+        assert strat.null == "stratified"
+        assert strat.strata["n_strata"] == 1
+        assert strat.p_sim == ref.p_sim == 0.21
+        numpy.testing.assert_array_equal(strat.sim, ref.sim)
+
+    def test_strata_summary_singletons_and_missing(self):
+        s_coords = numpy.array(
+            [[0.0, 0.0], [1.0, 0.0], [50.0, 0.0], [60.0, 0.0],
+             [100.0, 0.0], [101.0, 0.0]]
+        )
+        t_coords = numpy.array([[0.0], [1.0], [50.0], [60.0], [100.0], [101.0]])
+        stratum = numpy.array(["a", "a", None, "only", "b", "b"], dtype=object)
+        numpy.random.seed(12345)
+        res = Knox(
+            s_coords,
+            t_coords,
+            delta=2,
+            tau=2,
+            permutations=99,
+            keep=True,
+            stratum=stratum,
+        )
+        strata = res.strata
+        assert strata["counts"] == {"a": 2, "only": 1, "b": 2}
+        assert strata["n_strata"] == 3
+        assert strata["singletons"] == ["only"]
+        numpy.testing.assert_array_equal(strata["missing"], [2])
+        numpy.testing.assert_array_equal(
+            strata["exchangeable"], [True, True, False, False, True, True]
+        )
+        assert strata["n_exchangeable"] == 4
+        # singleton and missing strata never exchange their times, and the
+        # exchangeable pairs (0, 1) and (4, 5) are always preserved
+        numpy.testing.assert_array_equal(res.sim, numpy.full(99, 2.0))
+        assert res.p_sim == 1.0
+
+    def test_degenerate_strata_warn(self):
+        stratum = numpy.array(["a", "b", "c", "d"])
+        with pytest.warns(UserWarning, match="degenerate"):
+            res = Knox(
+                self.s_coords,
+                self.t_coords,
+                delta=2,
+                tau=2,
+                permutations=99,
+                keep=True,
+                stratum=stratum,
+            )
+        assert res.strata["n_exchangeable"] == 0
+        numpy.testing.assert_array_equal(res.sim, numpy.full(99, 2.0))
+        assert res.p_sim == 1.0
+
+    def test_stratum_validation(self):
+        with pytest.raises(ValueError, match="one label per event"):
+            Knox(self.s_coords, self.t_coords, delta=2, tau=2, stratum=["a", "b"])
+
+    def test_from_dataframe_stratum(self):
+        gdf = self.gdf.set_crs(21096)
+        gdf.index = [f"ev{i}" for i in range(gdf.shape[0])]
+        labels = numpy.where(gdf["T"] < 3500, "early", "late")
+
+        # a series is aligned to the event ids, whatever its own order
+        shuffled = pd.Series(labels, index=gdf.index).sample(frac=1, random_state=42)
+        res = Knox.from_dataframe(
+            gdf, time_col="T", delta=20, tau=5, permutations=0, stratum=shuffled
+        )
+        numpy.testing.assert_array_equal(res.strata["labels"], labels)
+        assert res.null == "stratified"
+
+        # a column name pulls the labels from the dataframe
+        gdf["season"] = labels
+        res = Knox.from_dataframe(
+            gdf, time_col="T", delta=20, tau=5, permutations=0, stratum="season"
+        )
+        numpy.testing.assert_array_equal(res.strata["labels"], labels)
+        with pytest.raises(ValueError, match="not found"):
+            Knox.from_dataframe(
+                gdf, time_col="T", delta=20, tau=5, permutations=0, stratum="nope"
+            )
+
+        # a series that shares no ids with the events is an error
+        foreign = pd.Series(labels, index=[f"other{i}" for i in range(gdf.shape[0])])
+        with pytest.raises(ValueError, match="could not be aligned"):
+            Knox.from_dataframe(
+                gdf, time_col="T", delta=20, tau=5, permutations=0, stratum=foreign
+            )
+
+        # ids not covered by the series are reported as missing strata
+        partial = pd.Series(labels[10:], index=gdf.index[10:])
+        res = Knox.from_dataframe(
+            gdf, time_col="T", delta=20, tau=5, permutations=0, stratum=partial
+        )
+        numpy.testing.assert_array_equal(res.strata["missing"], numpy.arange(10))
+
+
+class TestKnoxLocalStratified:
+    def setup_method(self):
+        # two spatially separated clusters; within each cluster the two
+        # events are close in time, across clusters they are not
+        self.s_coords = numpy.array(
+            [[0.0, 0.0], [1.0, 0.0], [100.0, 100.0], [101.0, 100.0]]
+        )
+        self.t_coords = numpy.array([[0.0], [1.0], [100.0], [101.0]])
+        self.stratum = numpy.array(["north", "north", "south", "south"])
+
+    def test_focal_time_fixed_within_strata(self):
+        numpy.random.seed(12345)
+        res = KnoxLocal(
+            self.s_coords,
+            self.t_coords,
+            delta=2,
+            tau=2,
+            permutations=99,
+            keep=True,
+            stratum=self.stratum,
+        )
+        assert res.null == "stratified"
+        # each focal keeps its own time stamp and can only exchange with its
+        # stratum partner, so its single space-time link is always preserved
+        numpy.testing.assert_array_equal(res.sims, numpy.ones((4, 99)))
+        numpy.testing.assert_array_equal(res.p_sims, numpy.ones(4))
+        assert res.sims.null == "stratified"
+        # the global permutation inference is stratified as well
+        assert res.p_sim == 1.0
+        # strata are exposed on the result geodataframe
+        assert "stratum" in res._gdf.columns
+        assert "exchangeable" in res._gdf.columns
+        numpy.testing.assert_array_equal(
+            res._gdf["exchangeable"].values, [True, True, True, True]
+        )
+
+        # the unconstrained conditional permutations can break the links
+        numpy.random.seed(12345)
+        res_unc = KnoxLocal(
+            self.s_coords, self.t_coords, delta=2, tau=2, permutations=99, keep=True
+        )
+        assert res_unc.null == "unconstrained"
+        assert res_unc.strata is None
+        assert (res_unc.sims != 1).any()
+
+    def test_local_degenerate_strata(self):
+        stratum = numpy.array(["a", "b", "c", "d"])
+        with pytest.warns(UserWarning, match="degenerate"):
+            res = KnoxLocal(
+                self.s_coords,
+                self.t_coords,
+                delta=2,
+                tau=2,
+                permutations=99,
+                keep=True,
+                stratum=stratum,
+            )
+        # no focal can exchange its time, so every permutation equals the
+        # observed configuration
+        numpy.testing.assert_array_equal(res.sims, numpy.ones((4, 99)))
+        numpy.testing.assert_array_equal(res.p_sims, numpy.ones(4))
+
+    def test_local_missing_stratum_fixed(self):
+        stratum = numpy.array(["north", "north", None, None], dtype=object)
+        numpy.random.seed(12345)
+        res = KnoxLocal(
+            self.s_coords,
+            self.t_coords,
+            delta=2,
+            tau=2,
+            permutations=99,
+            keep=True,
+            stratum=stratum,
+        )
+        numpy.testing.assert_array_equal(res.strata["missing"], [2, 3])
+        numpy.testing.assert_array_equal(
+            res.strata["exchangeable"], [True, True, False, False]
+        )
+        # focals with a missing stratum keep their time, and events in other
+        # strata can never receive it
+        numpy.testing.assert_array_equal(res.sims, numpy.ones((4, 99)))
+
+    def test_stratum_aligned_to_ids(self):
+        ids = ["e0", "e1", "e2", "e3"]
+        ser = pd.Series(
+            ["south", "north", "north", "south"], index=["e2", "e0", "e3", "e1"]
+        )
+        res = KnoxLocal(
+            self.s_coords,
+            self.t_coords,
+            delta=2,
+            tau=2,
+            permutations=0,
+            ids=ids,
+            stratum=ser,
+        )
+        numpy.testing.assert_array_equal(
+            res.strata["labels"], ["north", "south", "south", "north"]
+        )
+
+    def test_local_from_dataframe_stratum(self):
+        gdf = gpd.GeoDataFrame(
+            {"T": self.t_coords.ravel(), "region": self.stratum},
+            geometry=gpd.points_from_xy(self.s_coords[:, 0], self.s_coords[:, 1]),
+            crs="EPSG:21096",
+        )
+        numpy.random.seed(12345)
+        res = KnoxLocal.from_dataframe(
+            gdf,
+            time_col="T",
+            delta=2,
+            tau=2,
+            permutations=99,
+            keep=True,
+            stratum="region",
+        )
+        assert res.null == "stratified"
+        numpy.testing.assert_array_equal(res.sims, numpy.ones((4, 99)))
 
 
 class TestSpaceTimeEvents:
